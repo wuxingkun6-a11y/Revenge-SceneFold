@@ -1,7 +1,7 @@
 (() => {
   const { before, after } = vendetta.patcher;
   const { findByProps, findByStoreName } = vendetta.metro;
-  const { React, FluxDispatcher } = vendetta.metro.common;
+  const { React } = vendetta.metro.common;
   const { findInReactTree } = vendetta.utils;
   const { getAssetIDByName } = vendetta.ui.assets;
   const { showToast } = vendetta.ui.toasts;
@@ -9,7 +9,9 @@
   const { storage } = vendetta.plugin;
   const logger = vendetta.logger;
 
+  const FluxDispatcher = vendetta.metro.common.FluxDispatcher;
   const ActionSheet = findByProps("openLazy", "hideActionSheet");
+  const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow;
   const MessageStore = findByStoreName("MessageStore");
   const MessageActions =
     findByProps("fetchMessages", "sendMessage") ??
@@ -21,6 +23,8 @@
   const unpatches = [];
   let unpatchSheet = null;
   let active = false;
+  let running = false;
+  const pending = new Map();
 
   storage.records ??= {};
 
@@ -97,45 +101,36 @@
   const foldedLine = record =>
     `${PREFIX}${record?.summary || "已玩小剧场"}${SUFFIX}`;
 
+  const isFolded = message =>
+    typeof message?.content === "string" &&
+    message.content.startsWith(PREFIX) && message.content.endsWith(SUFFIX);
+
+  // MessageStore records use camelCase; Flux MESSAGE_CREATE expects API fields.
   function normalizeOriginal(message) {
-    const copy = clone(message) || {};
-
+    const copy = { ...(clone(message) || {}), ...(clone(message?.rawData) || {}) };
     copy.id = message.id;
-    copy.channel_id = channelIdOf(message);
-
-    if (!copy.author && message.author) copy.author = clone(message.author);
-    if (!copy.timestamp) copy.timestamp = message.timestamp || new Date().toISOString();
-    if (copy.content == null) copy.content = message.content ?? "";
-
+    copy.channel_id = channelIdOf(message) || copy.channel_id;
+    copy.author = clone(message.author ?? copy.author);
+    copy.timestamp = copy.timestamp || message.timestamp || new Date().toISOString();
+    copy.content = message.content ?? copy.content ?? "";
+    const aliases = {
+      message_snapshots: "messageSnapshots", message_reference: "messageReference",
+      referenced_message: "referencedMessage", sticker_items: "stickerItems",
+      edited_timestamp: "editedTimestamp", mention_roles: "mentionRoles",
+      mention_everyone: "mentionEveryone", webhook_id: "webhookId",
+    };
+    for (const [wire, internal] of Object.entries(aliases)) {
+      if (copy[wire] == null && message[internal] != null) copy[wire] = clone(message[internal]);
+    }
+    const snapshots = snapshotsOf(message);
+    if (Array.isArray(snapshots) && snapshots.length) {
+      copy.message_snapshots = snapshots.map(snapshot => ({
+        ...clone(snapshot),
+        message: clone(snapshot.message ?? snapshot),
+      }));
+    }
+    delete copy.rawData;
     return copy;
-  }
-
-  // Migrate records created by v0.1 / v0.1.1.
-  function migrateRecord(record, currentMessage) {
-    if (!record || record.originalMessage) return record;
-
-    if (record.original && typeof record.original === "object") {
-      const base = normalizeOriginal(currentMessage);
-      const old = record.original;
-
-      base.content = old.content ?? base.content ?? "";
-      if (old.message_snapshots !== undefined) base.message_snapshots = clone(old.message_snapshots);
-      if (old.messageSnapshots !== undefined) base.messageSnapshots = clone(old.messageSnapshots);
-      if (old.embeds !== undefined) base.embeds = clone(old.embeds);
-      if (old.attachments !== undefined) base.attachments = clone(old.attachments);
-      if (old.components !== undefined) base.components = clone(old.components);
-      if (old.sticker_items !== undefined) base.sticker_items = clone(old.sticker_items);
-      if (old.stickerItems !== undefined) base.stickerItems = clone(old.stickerItems);
-
-      record.originalMessage = base;
-      return record;
-    }
-
-    if (currentMessage && !String(currentMessage.content || "").startsWith(PREFIX)) {
-      record.originalMessage = normalizeOriginal(currentMessage);
-    }
-
-    return record;
   }
 
   function makeFoldedMessage(message, record) {
@@ -150,6 +145,8 @@
     fake.stickerItems = [];
     fake.reactions = fake.reactions ?? [];
 
+    // Forwarded-message payloads are what Discord 347.12 actually renders.
+    // Remove both known spellings and force this local copy to render as a normal text message.
     fake.message_snapshots = [];
     fake.messageSnapshots = [];
 
@@ -199,63 +196,74 @@
     });
   }
 
-  function replaceLoadedWithFolded(message, record) {
-    const channelId = channelIdOf(message);
-    const id = message?.id;
-    if (!channelId || !id) return;
-
-    const fake = makeFoldedMessage(message, record);
-
-    dispatchDelete(id, channelId);
-    later(() => dispatchCreate(fake), 25);
+  function cancelPending(key) {
+    const timer = pending.get(key);
+    if (timer != null) clearTimeout(timer);
+    pending.delete(key);
   }
 
-  function restoreFromServer(channelId, messageId) {
-    if (!channelId || !messageId) return false;
+  function replaceLocal(message, replacement, immediate = false) {
+    const key = keyOf(message);
+    if (!key) return false;
+    cancelPending(key);
+    // Keep the delete/create pair together: never leave a 25ms hole in the store.
+    const commit = () => {
+      pending.delete(key);
+      try {
+        dispatchDelete(message.id, channelIdOf(message));
+        dispatchCreate(replacement);
+      } catch (e) {
+        logger.error("[SceneFold] local replacement failed", e);
+        reloadAround(channelIdOf(message), message.id);
+      }
+    };
+    if (immediate) commit();
+    else pending.set(key, setTimeout(commit, 0));
+    return true;
+  }
 
-    dispatchDelete(messageId, channelId);
+  function replaceLoadedWithFolded(message, record) {
+    return replaceLocal(message, makeFoldedMessage(message, record));
+  }
 
+  function replaceLoadedWithOriginal(message, record, immediate = false) {
+    cancelPending(keyOf(message));
+    if (!record?.originalMessage?.id || isFolded(record.originalMessage)) return false;
+    const original = normalizeOriginal(record.originalMessage);
+    original.channel_id = channelIdOf(message);
+    return replaceLocal(message, original, immediate);
+  }
+
+  function reloadAround(channelId, messageId) {
     try {
       if (MessageActions?.fetchMessages) {
-        later(() => {
-          MessageActions.fetchMessages({
-            channelId,
-            limit: 50,
-            jump: { messageId, flash: false },
-          });
-        }, 80);
+        MessageActions.fetchMessages({
+          channelId,
+          limit: 50,
+          jump: { messageId, flash: false },
+        });
         return true;
       }
 
       if (MessageActions?.jumpToMessage) {
-        later(() => {
-          MessageActions.jumpToMessage({
-            channelId,
-            messageId,
-            flash: false,
-          });
-        }, 80);
+        MessageActions.jumpToMessage({
+          channelId,
+          messageId,
+          flash: false,
+        });
         return true;
       }
     } catch (e) {
-      logger.error("[SceneFold] restoreFromServer failed", e);
+      logger.error("[SceneFold] reloadAround failed", e);
     }
 
     return false;
   }
 
-  function restoreFromSavedCopy(message, record) {
-    const original = clone(record?.originalMessage);
-    const channelId = channelIdOf(message);
-    const id = message?.id;
-
-    if (!original?.id || !channelId || !id) return false;
-
-    original.channel_id = channelId;
-
-    dispatchDelete(id, channelId);
-    later(() => dispatchCreate(original), 80);
-    return true;
+  function ensureOriginal(record, message) {
+    if ((!record.originalMessage || isFolded(record.originalMessage)) && message && !isFolded(message)) {
+      record.originalMessage = normalizeOriginal(message);
+    }
   }
 
   function fold(message) {
@@ -276,7 +284,7 @@
         originalMessage: normalizeOriginal(current),
       };
     } else {
-      migrateRecord(record, current);
+      ensureOriginal(record, current);
       record.summary ||= autoSummary(current);
       record.collapsed = true;
     }
@@ -290,41 +298,27 @@
     const record = getRecord(message);
     if (!record) return;
 
-    migrateRecord(record, message);
     record.collapsed = false;
     refreshActive();
 
-    const channelId = channelIdOf(message);
-    const id = message.id;
+    const ok = replaceLoadedWithOriginal(message, record);
 
-    // v0.1.3: restore from Discord first instead of reinjecting the cached snapshot.
-    // This is much more reliable for forwarded messages on Android 347.12.
-    const fetching = restoreFromServer(channelId, id);
-
-    if (!fetching) {
-      restoreFromSavedCopy(message, record);
-    } else {
-      // Safety fallback: if Discord did not put the message back, use our saved copy.
-      later(() => {
-        const restored = MessageStore?.getMessage?.(channelId, id);
-        if (!restored) restoreFromSavedCopy(message, record);
-      }, 1200);
+    if (!ok) {
+      reloadAround(channelIdOf(message), message.id);
     }
 
-    showToast("正在恢复原消息", getAssetIDByName("Check"));
+    showToast(ok ? "已请求恢复原文" : "已取消折叠，正在重新加载；若未恢复请重进频道", getAssetIDByName("Check"));
   }
 
   function refold(message) {
     const record = getRecord(message);
     if (!record) return;
 
-    migrateRecord(record, message);
     record.collapsed = true;
     refreshActive();
 
     const current =
       MessageStore?.getMessage?.(channelIdOf(message), message.id) ??
-      record.originalMessage ??
       message;
 
     replaceLoadedWithFolded(current, record);
@@ -336,27 +330,17 @@
     const record = key ? records()[key] : undefined;
     if (!key || !record) return;
 
-    migrateRecord(record, message);
     record.collapsed = false;
 
-    const channelId = channelIdOf(message);
-    const id = message.id;
-
-    const fetching = restoreFromServer(channelId, id);
-
-    if (!fetching) {
-      restoreFromSavedCopy(message, record);
-    } else {
-      later(() => {
-        const restored = MessageStore?.getMessage?.(channelId, id);
-        if (!restored) restoreFromSavedCopy(message, record);
-      }, 1200);
-    }
-
-    delete records()[key];
+    const ok = replaceLoadedWithOriginal(message, record);
+    if (ok) delete records()[key];
     refreshActive();
 
-    showToast("已取消已玩标记，正在恢复原消息", getAssetIDByName("Check"));
+    if (!ok) {
+      reloadAround(channelIdOf(message), message.id);
+    }
+
+    showToast("已取消已玩标记", getAssetIDByName("Check"));
   }
 
   function editSummary(message) {
@@ -379,7 +363,6 @@
         if (record.collapsed) {
           const current =
             MessageStore?.getMessage?.(channelIdOf(message), message.id) ??
-            record.originalMessage ??
             message;
 
           replaceLoadedWithFolded(current, record);
@@ -388,13 +371,22 @@
     });
   }
 
+  // Intercept messages before Discord stores/renders them.
+  // This is the important v0.1.2 change: forwarded snapshots are replaced before
+  // the 347.12 forwarded-message renderer ever sees them.
   function transformMessage(message) {
     if (!message?.id) return message;
 
     const record = getRecord(message);
     if (!record?.collapsed) return message;
 
-    migrateRecord(record, message);
+    // Refresh from full server messages, never from synthetic placeholders or partial edits.
+    if (!isFolded(message) && message.author && message.timestamp &&
+        (message.content != null || snapshotsOf(message)?.length)) {
+      record.originalMessage = normalizeOriginal(message);
+    } else {
+      ensureOriginal(record, message);
+    }
     return makeFoldedMessage(message, record);
   }
 
@@ -530,7 +522,7 @@
         ) return;
 
         Promise.resolve(lazy).then(mod => {
-          if (unpatchSheet || !mod) return;
+          if (!running || unpatchSheet || !mod) return;
 
           const target =
             typeof mod.default === "function"
@@ -550,7 +542,16 @@
 
           unpatchSheet = after(prop, target, ([props], tree) => {
             try {
-              if (props?.message?.id) addRows(tree, props.message);
+              if (props?.message?.id) {
+                const channelId = channelIdOf(props.message) ?? props.channelId ?? props.channel?.id;
+                let message = props.message;
+                if (!channelIdOf(message)) {
+                  const matches = Object.keys(records()).filter(k => k.endsWith(`:${message.id}`));
+                  const resolved = channelId ?? (matches.length === 1 ? matches[0].split(":")[0] : null);
+                  if (resolved) message = { ...message, channel_id: resolved };
+                }
+                addRows(tree, message);
+              }
             } catch (e) {
               logger.error("[SceneFold] couldn't add menu rows", e);
             }
@@ -573,13 +574,14 @@
 
       if (!message) continue;
 
-      migrateRecord(record, message);
+      ensureOriginal(record, message);
       replaceLoadedWithFolded(message, record);
     }
   }
 
   return {
     onLoad() {
+      running = true;
       refreshActive();
 
       if (FluxDispatcher?._interceptors) {
@@ -595,12 +597,30 @@
       }
 
       patchSheet();
-      later(applyToLoaded, 100);
+      later(() => { if (running) applyToLoaded(); }, 100);
 
       logger.log("[SceneFold] v0.1.3 loaded");
     },
 
     onUnload() {
+      running = false;
+      for (const timer of pending.values()) clearTimeout(timer);
+      pending.clear();
+      for (const [key, record] of Object.entries(records())) {
+        if (!record?.collapsed) continue;
+
+        const colon = key.indexOf(":");
+        if (colon < 0) continue;
+
+        const channelId = key.slice(0, colon);
+        const id = key.slice(colon + 1);
+        const message = MessageStore?.getMessage?.(channelId, id);
+
+        if (message) {
+          replaceLoadedWithOriginal(message, record, true);
+        }
+      }
+
       unpatchSheet?.();
       unpatchSheet = null;
 
