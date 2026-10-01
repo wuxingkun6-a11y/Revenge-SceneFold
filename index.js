@@ -1,6 +1,6 @@
 (() => {
   const { before, after } = vendetta.patcher;
-  const { findByProps, findByStoreName } = vendetta.metro;
+  const { findByProps, findByStoreName, findByName } = vendetta.metro;
   const { React, ReactNative, FluxDispatcher, stylesheet } = vendetta.metro.common;
   const { findInReactTree } = vendetta.utils;
   const { getAssetIDByName } = vendetta.ui.assets;
@@ -13,9 +13,12 @@
   const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow;
   const MessageStore = findByStoreName("MessageStore") || findByProps("getMessage", "getMessages");
   const ChannelStore = findByStoreName("ChannelStore") || findByProps("getChannel", "getDMFromUserId");
+  const ChatItemModule = findByProps("DCDAutoModerationSystemMessageView", "default");
+  const MessageRecord = findByName?.("MessageRecord");
 
   const PREFIX = "🎭 已玩｜";
   const SUFFIX = " 〔长按展开〕";
+  const ZWSP = "\u200b";
   const patches = [];
   const pending = new Set();
 
@@ -26,7 +29,10 @@
   const clone = value => {
     if (value == null) return value;
     try { return JSON.parse(JSON.stringify(value)); }
-    catch (_) { return value; }
+    catch (_) {
+      try { return { ...value }; }
+      catch (_) { return value; }
+    }
   };
 
   const records = () => {
@@ -49,15 +55,23 @@
     return key ? records()[key] : undefined;
   };
 
+  const snapshotsOf = m =>
+    m?.message_snapshots ??
+    m?.messageSnapshots ??
+    m?.rawData?.message_snapshots ??
+    m?.rawData?.messageSnapshots;
+
   const extractText = m => {
+    const snapshots = snapshotsOf(m);
+    const firstSnapshotMessage = snapshots?.[0]?.message;
+
     const candidates = [
       m?.content,
-      m?.message_snapshots?.[0]?.message?.content,
-      m?.messageSnapshots?.[0]?.message?.content,
+      firstSnapshotMessage?.content,
       m?.embeds?.[0]?.description,
-      m?.message_snapshots?.[0]?.message?.embeds?.[0]?.description,
+      firstSnapshotMessage?.embeds?.[0]?.description,
       m?.embeds?.[0]?.title,
-      m?.message_snapshots?.[0]?.message?.embeds?.[0]?.title
+      firstSnapshotMessage?.embeds?.[0]?.title
     ];
 
     const raw = candidates.find(v => typeof v === "string" && v.trim()) || "";
@@ -78,89 +92,100 @@
   const foldedLine = record => `${PREFIX}${record.summary || "已玩小剧场"}${SUFFIX}`;
 
   const snapshotOriginal = m => ({
-    content: m?.content ?? "",
+    content: String(m?.content ?? "").replace(/\u200b/g, ""),
     message_snapshots: clone(m?.message_snapshots),
+    messageSnapshots: clone(m?.messageSnapshots),
     embeds: clone(m?.embeds),
     attachments: clone(m?.attachments),
     components: clone(m?.components),
     sticker_items: clone(m?.sticker_items),
+    stickerItems: clone(m?.stickerItems),
   });
 
-  const makeFoldPatch = record => {
-    const original = record.original || {};
+  const clearForwardedPayload = target => {
+    if ("message_snapshots" in target) target.message_snapshots = [];
+    if ("messageSnapshots" in target) target.messageSnapshots = [];
 
-    const patch = {
-      content: foldedLine(record),
-      embeds: [],
-      attachments: [],
-      components: [],
-      sticker_items: [],
-    };
-
-    if (Array.isArray(original.message_snapshots) && original.message_snapshots.length) {
-      const snapshots = clone(original.message_snapshots);
-
-      for (const snapshot of snapshots) {
-        if (!snapshot?.message) continue;
-
-        snapshot.message.content = foldedLine(record);
-        snapshot.message.embeds = [];
-        snapshot.message.attachments = [];
-        snapshot.message.components = [];
-        snapshot.message.sticker_items = [];
-      }
-
-      patch.content = "";
-      patch.message_snapshots = snapshots;
+    if (target.rawData && typeof target.rawData === "object") {
+      target.rawData = clone(target.rawData);
+      if ("message_snapshots" in target.rawData) target.rawData.message_snapshots = [];
+      if ("messageSnapshots" in target.rawData) target.rawData.messageSnapshots = [];
     }
-
-    return patch;
   };
 
-  const makeRestorePatch = record => {
-    const original = record.original || {};
+  const makeFoldedMessage = (message, record) => {
+    const data = clone(message) || {};
+    const channelId = channelIdOf(message);
 
-    return {
-      content: original.content ?? "",
-      message_snapshots: clone(original.message_snapshots),
-      embeds: clone(original.embeds) ?? [],
-      attachments: clone(original.attachments) ?? [],
-      components: clone(original.components) ?? [],
-      sticker_items: clone(original.sticker_items) ?? [],
-    };
+    data.id = message.id;
+    data.channel_id = channelId;
+    if (message.channelId != null) data.channelId = message.channelId;
+
+    data.content = foldedLine(record);
+    data.embeds = [];
+    data.attachments = [];
+    data.components = [];
+    data.sticker_items = [];
+    data.stickerItems = [];
+
+    clearForwardedPayload(data);
+
+    try {
+      return MessageRecord ? new MessageRecord(data) : data;
+    } catch (error) {
+      logger.error("[SceneFold] MessageRecord build failed", error);
+      return data;
+    }
   };
 
-  const dispatchUpdate = (message, patch, reason) => {
+  const dispatchFullMessage = (message, contentOverride, reason) => {
     const channelId = channelIdOf(message);
     const id = message?.id;
 
     if (!channelId || !id) return;
 
+    const current = MessageStore?.getMessage?.(channelId, id) || message;
     const pendingKey = `${channelId}:${id}:${reason}`;
-    if (pending.has(pendingKey)) return;
 
+    if (pending.has(pendingKey)) return;
     pending.add(pendingKey);
 
     setTimeout(() => {
       try {
+        const modified = clone(current) || {};
+        modified.id = id;
+        modified.channel_id = channelId;
+        modified.guild_id =
+          modified.guild_id ??
+          ChannelStore?.getChannel?.(channelId)?.guild_id;
+
+        if (contentOverride !== undefined) {
+          modified.content = contentOverride;
+        }
+
         FluxDispatcher.dispatch({
           type: "MESSAGE_UPDATE",
-          message: {
-            id,
-            channel_id: channelId,
-            guild_id: ChannelStore?.getChannel?.(channelId)?.guild_id,
-            ...patch,
-          },
+          message: modified,
           log_edit: false,
           otherPluginBypass: true,
           __sceneFold: true,
         });
       } catch (error) {
-        logger.error("SceneFold local update failed", error);
+        logger.error("[SceneFold] local refresh failed", error);
       } finally {
         pending.delete(pendingKey);
       }
     }, 0);
+  };
+
+  const refreshCollapsed = (message, record, reason) => {
+    const originalContent = String(record?.original?.content ?? "").replace(/\u200b/g, "");
+    dispatchFullMessage(message, originalContent + ZWSP, reason);
+  };
+
+  const refreshExpanded = (message, record, reason) => {
+    const originalContent = String(record?.original?.content ?? "").replace(/\u200b/g, "");
+    dispatchFullMessage(message, originalContent, reason);
   };
 
   const fold = message => {
@@ -181,7 +206,7 @@
       record.collapsed = true;
     }
 
-    dispatchUpdate(current, makeFoldPatch(record), "fold");
+    refreshCollapsed(current, record, "fold");
     showToast("已标记为已玩并折叠", getAssetIDByName("Check"));
   };
 
@@ -190,7 +215,7 @@
     if (!record) return;
 
     record.collapsed = false;
-    dispatchUpdate(message, makeRestorePatch(record), "expand");
+    refreshExpanded(message, record, "expand");
     showToast("已展开原文", getAssetIDByName("Check"));
   };
 
@@ -199,7 +224,7 @@
     if (!record) return;
 
     record.collapsed = true;
-    dispatchUpdate(message, makeFoldPatch(record), "refold");
+    refreshCollapsed(message, record, "refold");
     showToast("已重新折叠", getAssetIDByName("Check"));
   };
 
@@ -209,7 +234,8 @@
 
     if (!key || !record) return;
 
-    dispatchUpdate(message, makeRestorePatch(record), "unmark");
+    record.collapsed = false;
+    refreshExpanded(message, record, "unmark");
     delete records()[key];
 
     showToast("已取消已玩标记", getAssetIDByName("Check"));
@@ -227,61 +253,33 @@
       cancelText: "取消",
       onConfirm: value => {
         const summary = String(value || "").replace(/\s+/g, " ").trim();
-
-        if (!summary) {
-          throw new Error("摘要不能为空");
-        }
+        if (!summary) return;
 
         record.summary = summary.length > 80 ? `${summary.slice(0, 80)}…` : summary;
 
         if (record.collapsed) {
-          dispatchUpdate(message, makeFoldPatch(record), "summary");
+          refreshCollapsed(message, record, "summary");
         }
       },
     });
   };
 
-  const collectMessages = (value, out = [], seen = new Set(), depth = 0) => {
-    if (!value || depth > 7 || out.length > 150 || typeof value !== "object") {
-      return out;
-    }
+  const patchMessageRenderer = () => {
+    if (!ChatItemModule?.default) return null;
 
-    if (seen.has(value)) return out;
-    seen.add(value);
+    return before("default", ChatItemModule, args => {
+      const props = args?.[0];
+      const message = props?.message;
+      const record = message ? getRecord(message) : undefined;
 
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        collectMessages(item, out, seen, depth + 1);
+      if (!message || !record?.collapsed) return;
+
+      try {
+        props.message = makeFoldedMessage(message, record);
+      } catch (error) {
+        logger.error("[SceneFold] render override failed", error);
       }
-      return out;
-    }
-
-    if (value.id && (value.channel_id || value.channelId)) {
-      out.push(value);
-    }
-
-    for (const key of Object.keys(value).slice(0, 35)) {
-      if (key === "_owner" || key === "_store") continue;
-      collectMessages(value[key], out, seen, depth + 1);
-    }
-
-    return out;
-  };
-
-  const replayFromAction = action => {
-    if (!action || action.__sceneFold) return;
-
-    for (const message of collectMessages(action)) {
-      const record = getRecord(message);
-
-      if (record?.collapsed) {
-        dispatchUpdate(
-          message,
-          makeFoldPatch(record),
-          `replay:${action.type || "unknown"}`
-        );
-      }
-    }
+    });
   };
 
   const replayLoaded = () => {
@@ -296,7 +294,7 @@
       const message = MessageStore?.getMessage?.(channelId, id);
 
       if (message) {
-        dispatchUpdate(message, makeFoldPatch(record), "startup");
+        refreshCollapsed(message, record, "startup");
       }
     }
   };
@@ -332,7 +330,10 @@
 
   const patchActionSheet = () =>
     before("openLazy", LazyActionSheet, ([component, sheetKey, props]) => {
-      if (sheetKey !== "MessageLongPressActionSheet") return;
+      if (
+        typeof sheetKey !== "string" ||
+        !sheetKey.endsWith("MessageLongPressActionSheet")
+      ) return;
 
       const message = props?.message;
       if (!message || !component?.then || !ActionSheetRow) return;
@@ -342,23 +343,40 @@
           const unpatch = after("default", instance, (_, tree) => {
             React.useEffect(
               () => () => {
-                try {
-                  unpatch();
-                } catch (_) {}
+                try { unpatch(); } catch (_) {}
               },
               []
             );
 
-            const buttons = findInReactTree(
+            const groups = findInReactTree(
               tree,
               value =>
                 Array.isArray(value) &&
-                value.some(
-                  child =>
-                    child?.type?.name === "ActionSheetRow" ||
-                    typeof child?.props?.label === "string"
-                )
+                value[0]?.type?.name === "ActionSheetRowGroup"
             );
+
+            let buttons = null;
+
+            if (groups?.length) {
+              for (const group of groups) {
+                buttons = findInReactTree(
+                  group,
+                  value =>
+                    Array.isArray(value) &&
+                    value.some(child => child?.type?.name === "ActionSheetRow")
+                );
+                if (buttons) break;
+              }
+            }
+
+            if (!buttons) {
+              buttons = findInReactTree(
+                tree,
+                value =>
+                  Array.isArray(value) &&
+                  value.some(child => child?.type?.name === "ActionSheetRow")
+              );
+            }
 
             if (!buttons) return;
 
@@ -366,9 +384,7 @@
               buttons.some(child =>
                 String(child?.key || "").startsWith("scenefold-")
               )
-            ) {
-              return;
-            }
+            ) return;
 
             const record = getRecord(message);
             const rows = [];
@@ -390,7 +406,7 @@
                     ? "📖 展开已玩小剧场"
                     : "🎭 收起已玩小剧场",
                   record.collapsed ? "EyeIcon" : "ArchiveIcon",
-                  () => (record.collapsed ? expand(message) : refold(message))
+                  () => record.collapsed ? expand(message) : refold(message)
                 )
               );
 
@@ -417,7 +433,7 @@
           });
         })
         .catch(error => {
-          logger.error("SceneFold action-sheet patch failed", error);
+          logger.error("[SceneFold] action-sheet patch failed", error);
         });
     });
 
@@ -431,22 +447,33 @@
       }
 
       patches.push(patchActionSheet());
-      patches.push(
-        after("dispatch", FluxDispatcher, ([action]) => replayFromAction(action))
-      );
+
+      const renderPatch = patchMessageRenderer();
+      if (renderPatch) patches.push(renderPatch);
 
       replayLoaded();
-      logger.log("SceneFold loaded");
+      logger.log("[SceneFold] v0.1.1 loaded");
     },
 
     onUnload() {
-      for (const unpatch of patches.splice(0)) {
-        try {
-          unpatch();
-        } catch (_) {}
+      for (const [key, record] of Object.entries(records())) {
+        if (!record?.collapsed) continue;
+
+        const separatorIndex = key.indexOf(":");
+        if (separatorIndex < 0) continue;
+
+        const channelId = key.slice(0, separatorIndex);
+        const id = key.slice(separatorIndex + 1);
+        const message = MessageStore?.getMessage?.(channelId, id);
+
+        if (message) refreshExpanded(message, record, "unload");
       }
 
-      logger.log("SceneFold unloaded");
+      for (const unpatch of patches.splice(0)) {
+        try { unpatch?.(); } catch (_) {}
+      }
+
+      logger.log("[SceneFold] unloaded");
     },
   };
 })()
