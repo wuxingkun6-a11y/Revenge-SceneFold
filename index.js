@@ -17,6 +17,11 @@
     findByProps("fetchMessages", "sendMessage") ??
     findByProps("jumpToMessage");
 
+  const RestAPI = vendetta.metro.common.RestAPI ??
+    findByProps("get", "post", "put", "patch", "del");
+  const recovering = new Map();
+  const VERSION = "0.1.4";
+
   const PREFIX = "🎭 已玩｜";
   const SUFFIX = " 〔长按展开〕";
 
@@ -294,26 +299,88 @@
     showToast("已标记为已玩并折叠", getAssetIDByName("Check"));
   }
 
-  function expand(message) {
-    const record = getRecord(message);
-    if (!record) return;
-
-    record.collapsed = false;
-    refreshActive();
-
-    const ok = replaceLoadedWithOriginal(message, record);
-
-    if (!ok) {
-      reloadAround(channelIdOf(message), message.id);
+  function restoredInStore(message, original) {
+    const current = MessageStore?.getMessage?.(channelIdOf(message), message.id);
+    if (!current || isFolded(current) || current.content !== original.content) return false;
+    const expectedSnapshots = original.message_snapshots;
+    if (expectedSnapshots?.length) {
+      const actual = [current.message_snapshots, current.messageSnapshots,
+        current.rawData?.message_snapshots, current.rawData?.messageSnapshots]
+        .find(v => Array.isArray(v) && v.length);
+      if (!actual || actual.length !== expectedSnapshots.length) return false;
+      if (actual.some((v, i) => (v.message ?? v).content !== expectedSnapshots[i].message?.content)) return false;
     }
-
-    showToast(ok ? "已请求恢复原文" : "已取消折叠，正在重新加载；若未恢复请重进频道", getAssetIDByName("Check"));
+    if (original.attachments?.length && current.attachments?.length !== original.attachments.length) return false;
+    return true;
   }
+
+  async function recover(message, removeMark = false) {
+    const key = keyOf(message);
+    if (!key || recovering.has(key)) return;
+    // Also recover orphaned placeholders whose old record was already deleted.
+    const record = records()[key] ?? (records()[key] = {
+      summary: "待恢复小剧场", collapsed: false,
+    });
+    record.collapsed = false;
+    record.recoveryPending = true;
+    refreshActive();
+    cancelPending(key);
+    const token = {};
+    recovering.set(key, token);
+    const valid = () => running && recovering.get(key) === token && !record.collapsed;
+    showToast("SceneFold " + VERSION + "：正在从服务器取回原文");
+    try {
+      if (!RestAPI?.get) throw new Error("当前客户端未找到 REST 读取接口");
+      // Read only: use Discord's own authenticated HTTP client, never edit server messages.
+      const response = await RestAPI.get({
+        url: `/channels/${channelIdOf(message)}/messages`,
+        query: { around: message.id, limit: 5 },
+      });
+      if (!valid()) return;
+      const list = response?.body;
+      if (!Array.isArray(list)) throw new Error("服务器消息列表格式不兼容");
+      const original = list.find(m => m.id === message.id && channelIdOf(m) === channelIdOf(message));
+      if (!original || isFolded(original)) throw new Error("未取得原文：消息可能已删除或无权访问");
+      // Store the exact wire payload; the old MessageStore backup is deliberately not used.
+      record.originalMessage = clone(original);
+      record.originalSource = "server";
+      replaceLocal(message, clone(original), true);
+      FluxDispatcher.dispatch({ type: "MESSAGE_UPDATE", message: clone(original), __sceneFold: true });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      if (!valid()) return;
+      if (!restoredInStore(message, original)) {
+        // Let Discord's own loader process an authoritative page, rather than replaying the backup.
+        if (MessageActions?.fetchMessages) {
+          await MessageActions.fetchMessages({
+            channelId: channelIdOf(message), around: message.id, limit: 50,
+            jump: { messageId: message.id, flash: false }, skipLocalFetch: true,
+          });
+        }
+        if (!valid()) return;
+        if (!restoredInStore(message, original)) throw new Error("原文已取回，但客户端缓存未恢复；请完全重启 Discord 后重进帖子");
+      }
+      record.recoveryPending = false;
+      if (removeMark) delete records()[key];
+      showToast("原文已写回本机缓存；若画面仍是摘要，请重进帖子");
+    } catch (e) {
+      if (!valid()) return;
+      // Persist collapsed=false even on failure, so future server loads are never folded again.
+      const status = e?.status ?? e?.statusCode;
+      showToast(`恢复未完成${status ? `（HTTP ${status}）` : ""}：${e?.message || "网络请求失败，请重试"}`);
+      logger.error("[SceneFold] recovery failed", e?.message || "request failed");
+    } finally {
+      if (recovering.get(key) === token) recovering.delete(key);
+    }
+  }
+
+  function expand(message) { return recover(message); }
 
   function refold(message) {
     const record = getRecord(message);
     if (!record) return;
 
+    recovering.delete(keyOf(message));
+    record.recoveryPending = false;
     record.collapsed = true;
     refreshActive();
 
@@ -325,23 +392,7 @@
     showToast("已重新折叠", getAssetIDByName("Check"));
   }
 
-  function unmark(message) {
-    const key = keyOf(message);
-    const record = key ? records()[key] : undefined;
-    if (!key || !record) return;
-
-    record.collapsed = false;
-
-    const ok = replaceLoadedWithOriginal(message, record);
-    if (ok) delete records()[key];
-    refreshActive();
-
-    if (!ok) {
-      reloadAround(channelIdOf(message), message.id);
-    }
-
-    showToast("已取消已玩标记", getAssetIDByName("Check"));
-  }
+  function unmark(message) { return recover(message, true); }
 
   function editSummary(message) {
     const record = getRecord(message);
@@ -454,6 +505,12 @@
     const close = () => ActionSheet?.hideActionSheet?.();
     const record = getRecord(message);
 
+    if (!record && isFolded(message)) {
+      rows.splice(1, 0, makeRow(template, "scenefold-recover", "📖 从服务器恢复原文 · v" + VERSION,
+        "EyeIcon", () => { close(); recover(message, true); }));
+      return;
+    }
+
     if (!record) {
       rows.splice(
         1,
@@ -478,13 +535,13 @@
       makeRow(
         template,
         "scenefold-toggle",
-        record.collapsed
-          ? "📖 展开已玩小剧场"
+        (record.collapsed || record.recoveryPending || isFolded(message))
+          ? "📖 从服务器恢复原文 · v" + VERSION
           : "🎭 收起已玩小剧场",
         record.collapsed ? "EyeIcon" : "ArchiveIcon",
         () => {
           close();
-          record.collapsed ? expand(message) : refold(message);
+          (record.collapsed || record.recoveryPending || isFolded(message)) ? expand(message) : refold(message);
         }
       ),
       makeRow(
@@ -599,11 +656,13 @@
       patchSheet();
       later(() => { if (running) applyToLoaded(); }, 100);
 
-      logger.log("[SceneFold] v0.1.3 loaded");
+      logger.log("[SceneFold] v" + VERSION + " loaded");
+      showToast("SceneFold " + VERSION + " 已加载");
     },
 
     onUnload() {
       running = false;
+      recovering.clear();
       for (const timer of pending.values()) clearTimeout(timer);
       pending.clear();
       for (const [key, record] of Object.entries(records())) {

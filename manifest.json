@@ -1,13 +1,13 @@
 {
   "name": "SceneFold",
-  "description": "把已玩的小剧场在本机折叠成一行摘要，不影响服务器里的其他人。",
+  "description": "v0.1.4｜本机小剧场折叠；展开时从服务器只读获取原文。",
   "authors": [
     {
       "name": "wuxingkun6-a11y"
     }
   ],
   "main": "index.js",
-  "hash": "c9f27f8bfdc169e8709165bf17420a390205d0f8e783e99cf2d0fc506fd9ecc1",
+  "hash": "92a2b3ad91bc200799ac8607586e480eb9986cad931d22def008ed1665b6fe8d",
   "vendetta": {
     "icon": "ArchiveIcon"
   }
